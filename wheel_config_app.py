@@ -2,6 +2,7 @@ import queue
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -22,9 +23,9 @@ BAUDRATE = 115200
 STATUS_INTERVAL_MS = 250
 APP_VERSION = "0.2.0"
 
-# Completar cuando subas la app a GitHub, ejemplo:
-# APP_UPDATE_REPO = "tuusuario/volante-config"
-APP_UPDATE_REPO = ""
+APP_UPDATE_REPO = "JuanEGamerYT/volante-config"
+APP_UPDATE_DIR = ".updates"
+APP_UPDATE_MARKER = ".pending_update.json"
 
 RGB_MODE_LABELS = {
     "OFF": "Desactivado",
@@ -690,24 +691,10 @@ class WheelConfigApp(tk.Tk):
 
     def _update_check_worker(self, silent):
         try:
-            url = f"https://api.github.com/repos/{APP_UPDATE_REPO}/releases/latest"
-            request = urllib.request.Request(url, headers={"User-Agent": f"VolanteConfig/{APP_VERSION}"})
-            with urllib.request.urlopen(request, timeout=8) as response:
-                release = json.loads(response.read().decode("utf-8"))
-
-            latest = release.get("tag_name", "").lstrip("vV")
-            html_url = release.get("html_url", "")
-            assets = release.get("assets", [])
-            download_url = ""
-            for asset in assets:
-                name = asset.get("name", "").lower()
-                if name.endswith((".zip", ".exe", ".msi")):
-                    download_url = asset.get("browser_download_url", "")
-                    break
-
+            latest, download_url, source = self._find_available_app_update()
             if latest and version_tuple(latest) > version_tuple(APP_VERSION):
-                self.line_queue.put(f"APP UPDATE disponible {latest} (actual {APP_VERSION})")
-                self.after(0, lambda: self._prompt_update_download(latest, download_url or html_url))
+                self.line_queue.put(f"APP UPDATE disponible {latest} (actual {APP_VERSION}) desde {source}")
+                self.after(0, lambda latest=latest, url=download_url: self._prompt_update_download(latest, url))
             elif not silent:
                 self.line_queue.put(f"APP UPDATE no hay updates. Version actual {APP_VERSION}")
                 self.after(0, lambda: messagebox.showinfo("Updates", f"No hay updates. Version actual {APP_VERSION}"))
@@ -718,12 +705,124 @@ class WheelConfigApp(tk.Tk):
         finally:
             self.update_check_running = False
 
+    def _find_available_app_update(self):
+        candidates = []
+        errors = []
+
+        try:
+            latest, url = self._read_latest_release_update()
+            if latest:
+                candidates.append((latest, url, "GitHub Releases"))
+        except Exception as exc:
+            errors.append(f"release: {exc}")
+
+        try:
+            latest, url = self._read_branch_update()
+            if latest:
+                candidates.append((latest, url, "codigo remoto"))
+        except Exception as exc:
+            errors.append(f"rama: {exc}")
+
+        if candidates:
+            candidates.sort(key=lambda item: version_tuple(item[0]), reverse=True)
+            return candidates[0]
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return "", "", ""
+
+    def _read_latest_release_update(self):
+        url = f"https://api.github.com/repos/{APP_UPDATE_REPO}/releases/latest"
+        release = json.loads(self._http_get_text(url))
+
+        latest = release.get("tag_name", "").lstrip("vV")
+        html_url = release.get("html_url", "")
+        download_url = ""
+        for asset in release.get("assets", []):
+            name = asset.get("name", "").lower()
+            if name.endswith((".zip", ".exe", ".msi")):
+                download_url = asset.get("browser_download_url", "")
+                break
+        return latest, download_url or html_url
+
+    def _read_branch_update(self):
+        errors = []
+        for branch in ("main", "master"):
+            raw_url = f"https://raw.githubusercontent.com/{APP_UPDATE_REPO}/{branch}/wheel_config_app.py"
+            try:
+                source = self._http_get_text(raw_url)
+            except Exception as exc:
+                errors.append(f"{branch}: {exc}")
+                continue
+
+            latest = self._extract_remote_app_version(source)
+            if latest:
+                zip_url = f"https://github.com/{APP_UPDATE_REPO}/archive/refs/heads/{branch}.zip"
+                return latest, zip_url
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return "", ""
+
+    def _http_get_text(self, url):
+        request = urllib.request.Request(url, headers={"User-Agent": f"VolanteConfig/{APP_VERSION}"})
+        with urllib.request.urlopen(request, timeout=8) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    def _extract_remote_app_version(self, source):
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("APP_VERSION") or "=" not in stripped:
+                continue
+            value = stripped.split("=", 1)[1].strip().strip("'\"")
+            return value
+        return ""
+
     def _prompt_update_download(self, latest, url):
         if not url:
             messagebox.showwarning("Updates", f"Hay version {latest}, pero no encontre asset para descargar.")
             return
-        if messagebox.askyesno("Updates", f"Hay una version nueva: {latest}\n\nAbrir descarga ahora?"):
+        if not messagebox.askyesno("Updates", f"Hay una version nueva: {latest}\n\nDescargarla ahora?"):
+            return
+
+        if not url.lower().split("?", 1)[0].endswith(".zip"):
             webbrowser.open(url)
+            return
+
+        threading.Thread(target=self._download_app_update_worker, args=(latest, url), daemon=True).start()
+
+    def _download_app_update_worker(self, latest, url):
+        try:
+            root = Path(__file__).resolve().parent
+            update_dir = root / APP_UPDATE_DIR
+            update_dir.mkdir(parents=True, exist_ok=True)
+            zip_path = update_dir / f"volante-config-{latest}.zip"
+
+            self.line_queue.put(f"APP UPDATE descargando {latest}")
+            request = urllib.request.Request(url, headers={"User-Agent": f"VolanteConfig/{APP_VERSION}"})
+            with urllib.request.urlopen(request, timeout=30) as response, zip_path.open("wb") as output:
+                while True:
+                    chunk = response.read(1024 * 64)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+
+            marker = {
+                "version": latest,
+                "zip": str(zip_path),
+                "url": url,
+            }
+            (root / APP_UPDATE_MARKER).write_text(json.dumps(marker, indent=2), encoding="utf-8")
+            self.line_queue.put("APP UPDATE descargada. Se aplicara en el proximo inicio.")
+            self.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Updates",
+                    "Update descargada.\n\nCierra y abre Volante Config: el inicio siguiente reemplaza los archivos y abre la version nueva.",
+                ),
+            )
+        except Exception as exc:
+            self.line_queue.put(f"APP UPDATE ERROR descargando: {exc}")
+            self.after(0, lambda exc=exc: messagebox.showerror("Updates", f"No pude descargar la update:\n{exc}"))
 
     def apply_bool_options(self):
         self.send(f"BOOL POV {1 if self.enable_pov.get() else 0}")
@@ -757,7 +856,8 @@ class WheelConfigApp(tk.Tk):
 
     def _run_ota_upload_worker(self, ip, password):
         root = Path(__file__).resolve().parent
-        script = root / "upload_ota.ps1"
+        ota_dir = root / "ota"
+        script = ota_dir / "upload_ota.ps1"
         if not script.exists():
             self.line_queue.put(f"APP OTA ERROR no existe {script}")
             self.line_queue.put("APP_OTA_DONE")
@@ -779,7 +879,7 @@ class WheelConfigApp(tk.Tk):
         try:
             process = subprocess.Popen(
                 cmd,
-                cwd=str(root),
+                cwd=str(ota_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -836,7 +936,95 @@ class WheelConfigApp(tk.Tk):
         self.destroy()
 
 
+def apply_pending_update_if_needed():
+    root = Path(__file__).resolve().parent
+    marker_path = root / APP_UPDATE_MARKER
+    if not marker_path.exists():
+        return False
+
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        zip_path = Path(marker.get("zip", ""))
+        version = marker.get("version", "?")
+    except Exception:
+        marker_path.unlink(missing_ok=True)
+        return False
+
+    if not zip_path.exists():
+        marker_path.unlink(missing_ok=True)
+        return False
+
+    updater_dir = Path(tempfile.gettempdir()) / "VolanteConfigUpdate"
+    updater_dir.mkdir(parents=True, exist_ok=True)
+    ps_path = updater_dir / "apply_update.ps1"
+    bat_path = updater_dir / "apply_update.bat"
+
+    ps_path.write_text(
+        """param(
+  [Parameter(Mandatory = $true)]
+  [string]$Root,
+
+  [Parameter(Mandatory = $true)]
+  [string]$Zip,
+
+  [string]$Version = ""
+)
+
+$ErrorActionPreference = "Stop"
+Start-Sleep -Seconds 2
+
+$extractDir = Join-Path ([System.IO.Path]::GetTempPath()) "VolanteConfigUpdateExtract"
+if (Test-Path $extractDir) {
+  Remove-Item -LiteralPath $extractDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+Expand-Archive -LiteralPath $Zip -DestinationPath $extractDir -Force
+$source = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1
+if ($null -eq $source) {
+  throw "ZIP invalido: no encontre carpeta fuente."
+}
+
+$obsolete = @("install_windows.bat", "instalar_volante_config.bat", "upload_ota.ps1")
+foreach ($name in $obsolete) {
+  $path = Join-Path $Root $name
+  if (Test-Path $path) {
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Copy-Item -Path (Join-Path $source.FullName "*") -Destination $Root -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $Root ".pending_update.json") -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+
+$launcher = Join-Path $Root "run_wheel_config_app.bat"
+if (Test-Path $launcher) {
+  Start-Process -FilePath $launcher -WorkingDirectory $Root
+} else {
+  Start-Process -FilePath "python" -ArgumentList (Join-Path $Root "wheel_config_app.py") -WorkingDirectory $Root
+}
+""",
+        encoding="utf-8",
+    )
+
+    bat_path.write_text(
+        f"""@echo off
+powershell -NoProfile -ExecutionPolicy Bypass -File "{ps_path}" -Root "{root}" -Zip "{zip_path}" -Version "{version}"
+del /f /q "{ps_path}" >nul 2>nul
+del /f /q "%~f0" >nul 2>nul
+""",
+        encoding="utf-8",
+    )
+
+    subprocess.Popen(["cmd", "/c", str(bat_path)], cwd=str(root))
+    return True
+
+
 def main():
+    if apply_pending_update_if_needed():
+        return 0
+
     if serial is None:
         print("Falta pyserial. Instala con: python -m pip install -r requirements.txt")
         messagebox.showerror("Dependencia faltante", "Falta pyserial.\n\nEjecuta:\npython -m pip install -r requirements.txt")
